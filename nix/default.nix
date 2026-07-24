@@ -3,7 +3,7 @@
 
 {
   pname = "logos-package-downloader";
-  # VERSION is only present on release branches; dev branches use a placeholder.
+  # VERSION is tracked for releases; branches without it use a dev placeholder.
   version = if builtins.pathExists ../VERSION
     then pkgs.lib.removeSuffix "\n" (builtins.readFile ../VERSION)
     else "1.0.0-dev";
