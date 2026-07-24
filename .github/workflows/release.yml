@@ -75,8 +75,10 @@ jobs:
         include:
           - arch: x86_64-linux
             runner: ubuntu-latest
+            machine: x86_64
           - arch: aarch64-linux
             runner: ubuntu-24.04-arm
+            machine: aarch64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -110,8 +112,10 @@ jobs:
         env:
           EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
           EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_MACHINE: ${{ matrix.machine }}
         run: |
           set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_MACHINE"
           archive="$(find . -maxdepth 1 -name 'lgpd-*-linux.tar.gz' -print -quit)"
           test -n "$archive"
           extract="$RUNNER_TEMP/lgpd-linux-smoke"
@@ -165,6 +169,7 @@ jobs:
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
+          test "$(uname -m)" = arm64
           extract="$RUNNER_TEMP/lgpd-macos-smoke"
           mkdir "$extract"
           tar -xzf lgpd-aarch64-macos.tar.gz -C "$extract"
