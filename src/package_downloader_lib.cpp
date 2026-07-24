@@ -713,9 +713,9 @@ std::string PackageDownloaderLib::getCatalogJson() {
 }
 
 std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOrName) {
+    impl_->ensureMetadata();
     auto repo = impl_->registry.findByUrlOrName(urlOrName);
     if (!repo) return "[]";
-    impl_->ensureMetadata();
     // Same synthesised shape as getCatalogJson, scoped to one repo —
     // callers (CLI `--repo`, the UI, the C API) get repositoryUrl,
     // date-sorted versions, and the package-level header fields, not the

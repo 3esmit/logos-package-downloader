@@ -15,14 +15,22 @@ namespace fs = std::filesystem;
 //     index.json it points at; everything else 404s.
 namespace {
 constexpr const char* kIndexUrl = "https://test.local/index.json";
+constexpr const char* kCustomRepoUrl = "https://custom.test/logos-repo.json";
+constexpr const char* kCustomIndexUrl = "https://custom.test/index.json";
 
 class MockFetcher : public lgpd::Fetcher {
 public:
     std::string repoJson;   // served for the default repo URL
     std::string indexJson;  // served for kIndexUrl
+    std::map<std::string, std::string> extraResponses;
     bool get(const std::string& url, std::string& out) override {
         if (url == lgpd::kDefaultRepositoryUrl) { out = repoJson;  return true; }
         if (url == kIndexUrl)                    { out = indexJson; return true; }
+        auto it = extraResponses.find(url);
+        if (it != extraResponses.end()) {
+            out = it->second;
+            return true;
+        }
         return false;
     }
     bool getToFile(const std::string&, const std::string&) override { return false; }
@@ -66,6 +74,28 @@ std::shared_ptr<MockFetcher> catalogFetcher(const json& uiDepRange) {
     return f;
 }
 
+std::shared_ptr<MockFetcher> scopedCatalogFetcher() {
+    auto f = catalogFetcher(json{{"name", "blockchain_module"}, {"version", "*"}});
+    f->extraResponses[kCustomRepoUrl] =
+        json{{"schemaVersion", 1},
+             {"name", "custom"},
+             {"displayName", "Custom"},
+             {"indexUrl", kCustomIndexUrl},
+             {"trustedSigners", json::array()}}
+            .dump();
+
+    json version = makeVersion("1.0.0", "h_custom_100", json::array());
+    version["manifest"]["name"] = "custom_module";
+    f->extraResponses[kCustomIndexUrl] =
+        json{{"schemaVersion", 2},
+             {"repositoryName", "custom"},
+             {"packages",
+              json::array(
+                  {json{{"name", "custom_module"}, {"versions", json::array({version})}}})}}
+            .dump();
+    return f;
+}
+
 // Collect resolved entries by name -> list of versions.
 std::map<std::string, std::vector<std::string>> resolvedVersions(const std::string& resolvedJson) {
     std::map<std::string, std::vector<std::string>> byName;
@@ -76,6 +106,28 @@ std::map<std::string, std::vector<std::string>> resolvedVersions(const std::stri
     return byName;
 }
 }  // namespace
+
+class ScopedCatalogTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        configPath = fs::temp_directory_path()
+            / ("lgpd_test_scoped_" + std::to_string(std::rand()) + ".json");
+        fetcher = scopedCatalogFetcher();
+
+        lgpd::PackageDownloaderLib setup(configPath.string());
+        setup.setFetcher(fetcher);
+        const std::string error = setup.registry().addRepository(kCustomRepoUrl);
+        ASSERT_TRUE(error.empty()) << error;
+    }
+
+    void TearDown() override {
+        std::error_code ec;
+        fs::remove(configPath, ec);
+    }
+
+    fs::path configPath;
+    std::shared_ptr<MockFetcher> fetcher;
+};
 
 // ─── Semver matcher ───────────────────────────────────────────────────────────
 // These are pure tests — no network involved.
@@ -333,4 +385,26 @@ TEST(Catalog, ReturnsJsonArrayWhenNoNetwork) {
     json catalog;
     ASSERT_NO_THROW(catalog = json::parse(lib.getCatalogJson()));
     EXPECT_TRUE(catalog.is_array());
+}
+
+TEST_F(ScopedCatalogTest, FreshConfigResolvesCanonicalRepositoryName) {
+    lgpd::PackageDownloaderLib fresh(configPath.string());
+    fresh.setFetcher(fetcher);
+
+    const json catalog = json::parse(fresh.getCatalogForRepoJson("custom"));
+
+    ASSERT_EQ(catalog.size(), 1u);
+    EXPECT_EQ(catalog[0].value("name", ""), "custom_module");
+    EXPECT_EQ(catalog[0].value("repositoryName", ""), "custom");
+}
+
+TEST_F(ScopedCatalogTest, FreshConfigRefreshesDescriptorUrlMatch) {
+    lgpd::PackageDownloaderLib fresh(configPath.string());
+    fresh.setFetcher(fetcher);
+
+    const json catalog = json::parse(fresh.getCatalogForRepoJson(kCustomRepoUrl));
+
+    ASSERT_EQ(catalog.size(), 1u);
+    EXPECT_EQ(catalog[0].value("name", ""), "custom_module");
+    EXPECT_EQ(catalog[0].value("repositoryName", ""), "custom");
 }
