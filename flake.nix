@@ -20,10 +20,10 @@
       # checkout, or "dirty" for a path override.
       revOf = input: input.rev or input.dirtyRev or "dirty";
       buildInfo = {
-        # VERSION is only present on release branches. On master (pre-release CI
-        # builds) there is no VERSION file, so fall back to a "pre-release-{sha7}"
-        # string derived from self.rev. Dirty local builds lack self.rev and get
-        # an empty string, which the CLI renders as "dev".
+        # VERSION is the tracked source release identity. Upstream-compatible
+        # branches that omit it fall back to a "pre-release-{sha7}" string
+        # derived from self.rev. Dirty local builds lack self.rev and get an
+        # empty string, which the CLI renders as "dev".
         version = if builtins.pathExists ./VERSION
           then nixpkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION)
           else if (self ? rev) then "pre-release-${builtins.substring 0 7 self.rev}" else "";

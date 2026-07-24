@@ -262,8 +262,8 @@ command. There are **no** `--release` or `categories` features (the workspace
 README are authoritative). The version is build-derived: `lgpd version <v>`
 followed by this repo's commit (with a `-dirty` marker) and the locked commits
 of the flake inputs, all baked in at build time by `nix/build-info.nix`. `<v>`
-is the `VERSION` file contents on a release branch, `pre-release-<sha7>` on a
-clean master build, or `dev` for a dirty local build.
+is the `VERSION` file contents when present, `pre-release-<sha7>` on a clean
+build without that file, or `dev` for a dirty local build.
 
 #### Catalog commands
 

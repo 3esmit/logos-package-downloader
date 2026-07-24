@@ -1,19 +1,9 @@
 name: Build & Release
 
-# Builds distributable lgpd artifacts and, on release/** branches, publishes
-# them as a GitHub pre-release. Modeled on logos-basecamp's build.yml.
-#
-# Version stamping: `lgpd --version` is baked at build time from a VERSION file
-# at the repo root (read by flake.nix). VERSION exists only on release/**
-# branches — add it (e.g. `echo 0.2.0 > VERSION`) on the release branch and this
-# job bakes that version in. master builds fall back to `pre-release-<sha7>`,
-# dirty local builds to `dev`; the commit hash (with a `-dirty` marker) is
-# always reported.
-#
-#   Linux (x86_64 + aarch64): build the AppImage, chmod +x, wrap in a tar.gz.
-#   macOS (aarch64):          build the portable cli-bundle-dir (bin/ + lib/),
-#                             strip the Gatekeeper quarantine flag the way
-#                             Homebrew handles casks, wrap in a tar.gz.
+# Builds the portable lgpd archives on their native platforms for every
+# supported branch/PR. Publishing is an explicit workflow dispatch from the
+# exact master commit: VERSION supplies the SemVer tag and CHANGELOG.md records
+# the release. The draft is downloaded and verified before it becomes public.
 
 on:
   push:
@@ -22,10 +12,65 @@ on:
       - 'release/**'
   pull_request:
     branches: [master]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Publish the current master version as a prerelease."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
+  validate:
+    name: Validate release contract
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate source release identity
+        id: identity
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/check-release-contract.py)"
+          python3 scripts/check-release-contract.py --tag "$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require an unpublished release from exact master
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRM" = true
+          test "$GITHUB_REF" = refs/heads/master
+          remote_master="$(git ls-remote origin refs/heads/master | cut -f1)"
+          test -n "$remote_master"
+          test "$remote_master" = "$GITHUB_SHA"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "refusing to overwrite existing tag $TAG" >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "refusing to overwrite existing release $TAG" >&2
+            exit 1
+          fi
+
   build-appimage:
+    needs: validate
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64-linux
@@ -50,28 +95,44 @@ jobs:
       - name: Build cli-appimage
         run: nix build .#cli-appimage -L
 
-      - name: Smoke test (AppImage runs)
-        run: |
-          src=$(find result/ -name '*.AppImage' -print -quit)
-          out=$(APPIMAGE_EXTRACT_AND_RUN=1 "$src" --help 2>&1 || true)
-          echo "$out"
-          echo "$out" | grep -qi usage
-
       - name: Package AppImage as tarball
         run: |
+          set -euo pipefail
           arch="${{ matrix.arch }}"
           arch_short="${arch%%-*}"
-          src=$(find result/ -name '*.AppImage' -print -quit)
+          src="$(find result/ -name '*.AppImage' -print -quit)"
+          test -n "$src"
           cp "$src" "lgpd-${arch_short}.AppImage"
           chmod +x "lgpd-${arch_short}.AppImage"
           tar -czf "lgpd-${arch_short}-linux.tar.gz" "lgpd-${arch_short}.AppImage"
+
+      - name: Smoke packaged AppImage on native runner
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          archive="$(find . -maxdepth 1 -name 'lgpd-*-linux.tar.gz' -print -quit)"
+          test -n "$archive"
+          extract="$RUNNER_TEMP/lgpd-linux-smoke"
+          mkdir "$extract"
+          tar -xzf "$archive" -C "$extract"
+          binary="$(find "$extract" -name '*.AppImage' -print -quit)"
+          test -n "$binary"
+          output="$(APPIMAGE_EXTRACT_AND_RUN=1 "$binary" --version)"
+          printf '%s\n' "$output"
+          grep -F "lgpd version $EXPECTED_VERSION" <<<"$output"
+          grep -F "commit: $EXPECTED_COMMIT" <<<"$output"
 
       - uses: actions/upload-artifact@v4
         with:
           name: appimage-${{ matrix.arch }}
           path: lgpd-*-linux.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   build-macos-bundle:
+    needs: validate
     runs-on: macos-latest
 
     steps:
@@ -87,39 +148,50 @@ jobs:
       - name: Build cli-bundle-dir
         run: nix build .#cli-bundle-dir -L
 
-      - name: Smoke test (bundled binary runs)
-        run: |
-          out=$(./result/bin/lgpd --help 2>&1 || true)
-          echo "$out"
-          echo "$out" | grep -qi usage
-
       - name: Package bundle as tarball
         run: |
+          set -euo pipefail
           dst="lgpd-aarch64-macos"
-          # Copy out of the read-only Nix store into a writable, archive-named dir.
-          rm -rf "$dst" && mkdir "$dst"
+          mkdir "$dst"
           cp -RL result/. "$dst/"
           chmod -R u+w "$dst"
-          # Strip the Gatekeeper quarantine attribute the way Homebrew's cask
-          # Quarantine.release! does. No-op on freshly built binaries (the Nix
-          # store carries none) but keeps the published artifact clean. The
-          # binaries are already validly ad-hoc signed by Nix — no re-signing.
+          # Keep the portable archive free of browser-style quarantine metadata.
           /usr/bin/xattr -r -d com.apple.quarantine "$dst" 2>/dev/null || true
           tar -czf "$dst.tar.gz" "$dst"
+
+      - name: Smoke packaged bundle on Apple Silicon
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          extract="$RUNNER_TEMP/lgpd-macos-smoke"
+          mkdir "$extract"
+          tar -xzf lgpd-aarch64-macos.tar.gz -C "$extract"
+          binary="$extract/lgpd-aarch64-macos/bin/lgpd"
+          test -x "$binary"
+          output="$("$binary" --version)"
+          printf '%s\n' "$output"
+          grep -F "lgpd version $EXPECTED_VERSION" <<<"$output"
+          grep -F "commit: $EXPECTED_COMMIT" <<<"$output"
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64-darwin
           path: lgpd-aarch64-macos.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')
-    needs: [build-appimage, build-macos-bundle]
+    if: github.event_name == 'workflow_dispatch'
+    needs: [validate, build-appimage, build-macos-bundle]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: appimage-x86_64-linux
@@ -135,47 +207,103 @@ jobs:
           name: macos-aarch64-darwin
           path: artifacts/
 
-      - name: Generate tag
-        id: tag
-        run: echo "tag=pre-release-${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+      - name: Verify complete artifact set and write checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          test -f lgpd-x86_64-linux.tar.gz
+          test -f lgpd-aarch64-linux.tar.gz
+          test -f lgpd-aarch64-macos.tar.gz
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" = 3
+          sha256sum \
+            lgpd-x86_64-linux.tar.gz \
+            lgpd-aarch64-linux.tar.gz \
+            lgpd-aarch64-macos.tar.gz \
+            > SHA256SUMS
+          sha256sum -c SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          # lgpd $VERSION
+
+          **Channel:** Alpha
+
+          Portable archives are built and smoke-tested on their native runners:
+
+          - Linux x86_64 AppImage
+          - Linux ARM64 AppImage
+          - Apple Silicon macOS bundle
+
+          SHA256SUMS authenticates the exact uploaded archives. See
+          CHANGELOG.md in tag $TAG for release details.
+          EOF
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Pre-release ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: lgpd ${{ needs.validate.outputs.version }} (Alpha)
+          body_path: release-notes.md
+          draft: true
           prerelease: true
-          body: |
-            ## Install
-
-            ### Linux
-
-            The artifact is an [AppImage](https://appimage.org/) — a single self-contained executable. Download it, extract, and drop it on your `PATH` as `lgpd` (swap `x86_64` for `aarch64` on ARM):
-
-            ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/lgpd-x86_64-linux.tar.gz
-            tar -xvf lgpd-x86_64-linux.tar.gz
-            mkdir -p ~/.local/bin
-            install -m755 lgpd-x86_64.AppImage ~/.local/bin/lgpd
-            # make sure ~/.local/bin is on your PATH (add this to ~/.bashrc or ~/.zshrc):
-            export PATH="$HOME/.local/bin:$PATH"
-            ```
-
-            Now `lgpd` runs from anywhere. (If you hit a FUSE error, run it as `APPIMAGE_EXTRACT_AND_RUN=1 lgpd`.)
-
-            ### macOS (Apple Silicon)
-
-            > **Download from the terminal with `wget` or `curl` — _not_ a web browser.** Browsers tag downloads with `com.apple.quarantine`, which makes Gatekeeper block this unsigned binary. Fetching over the terminal and extracting with `tar` never sets that flag, so the binary runs as-is — no signing or notarization needed.
-
-            ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/lgpd-aarch64-macos.tar.gz
-            tar -xvf lgpd-aarch64-macos.tar.gz
-            # move the whole folder somewhere permanent (keep its contents together —
-            # the binary finds its libraries via ../lib) and put its bin/ on your PATH:
-            mv lgpd-aarch64-macos ~/.local/lgpd
-            echo 'export PATH="$HOME/.local/lgpd/bin:$PATH"' >> ~/.zshrc
-            source ~/.zshrc
-            ```
-
-            Now `lgpd` runs from anywhere.
+          make_latest: false
           files: |
-            artifacts/*.tar.gz
+            artifacts/lgpd-x86_64-linux.tar.gz
+            artifacts/lgpd-aarch64-linux.tar.gz
+            artifacts/lgpd-aarch64-macos.tar.gz
+            artifacts/SHA256SUMS
+
+      - name: Verify uploaded draft and published Linux runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,targetCommitish \
+            --jq '[.isDraft, .targetCommitish] | @tsv')"
+          test "$state" = "$(printf 'true\t%s' "$GITHUB_SHA")"
+
+          mkdir published-artifacts
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir published-artifacts
+          (
+            cd published-artifacts
+            test "$(find . -maxdepth 1 -type f | wc -l)" = 4
+            sha256sum -c SHA256SUMS
+          )
+
+          mkdir published-linux
+          tar -xzf published-artifacts/lgpd-x86_64-linux.tar.gz \
+            -C published-linux
+          binary="$(find published-linux -name '*.AppImage' -print -quit)"
+          test -n "$binary"
+          output="$(APPIMAGE_EXTRACT_AND_RUN=1 "$binary" --version)"
+          printf '%s\n' "$output"
+          grep -F "lgpd version $VERSION" <<<"$output"
+          grep -F "commit: $GITHUB_SHA" <<<"$output"
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease --latest=false
+
+      - name: Remove failed draft
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,targetCommitish \
+            --jq '[.isDraft, .targetCommitish] | @tsv' 2>/dev/null || true)"
+          if test "$state" = "$(printf 'true\t%s' "$GITHUB_SHA")"; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --yes --cleanup-tag
+          fi
