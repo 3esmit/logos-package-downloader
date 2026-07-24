@@ -248,37 +248,130 @@ jobs:
           CHANGELOG.md in tag $TAG for release details.
           EOF
 
-      - name: Create draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.validate.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: lgpd ${{ needs.validate.outputs.version }} (Alpha)
-          body_path: release-notes.md
-          draft: true
-          prerelease: true
-          make_latest: false
-          files: |
-            artifacts/lgpd-x86_64-linux.tar.gz
-            artifacts/lgpd-aarch64-linux.tar.gz
-            artifacts/lgpd-aarch64-macos.tar.gz
-            artifacts/SHA256SUMS
+      - name: Atomically claim exact release tag
+        id: claim_tag
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag "$TAG" "$GITHUB_SHA"
+          git push --atomic origin "refs/tags/$TAG:refs/tags/$TAG"
+          printf 'owned=true\nexpected_oid=%s\n' \
+            "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Verify uploaded draft and published Linux runtime
+      - name: Create owned draft release
+        id: create_release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.validate.outputs.version }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,targetCommitish \
-            --jq '[.isDraft, .targetCommitish] | @tsv')"
-          test "$state" = "$(printf 'true\t%s' "$GITHUB_SHA")"
+          payload="$RUNNER_TEMP/lgpd-release-payload.json"
+          jq -n \
+            --arg tag "$TAG" \
+            --arg commit "$GITHUB_SHA" \
+            --arg name "lgpd $VERSION (Alpha)" \
+            --rawfile body release-notes.md \
+            '{
+              tag_name: $tag,
+              target_commitish: $commit,
+              name: $name,
+              body: $body,
+              draft: true,
+              prerelease: true,
+              make_latest: "false"
+            }' > "$payload"
+          response="$(gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/releases" --input "$payload")"
+          release_id="$(jq -er '.id | tostring' <<<"$response")"
+          printf 'release_id=%s\nowned=true\n' \
+            "$release_id" >> "$GITHUB_OUTPUT"
+          jq -e \
+            --arg tag "$TAG" \
+            --arg commit "$GITHUB_SHA" \
+            '.tag_name == $tag
+              and .target_commitish == $commit
+              and .draft == true
+              and .prerelease == true' \
+            <<<"$response" >/dev/null
+
+      - name: Upload assets to exact owned draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.create_release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_ID"
+          for asset in \
+            artifacts/lgpd-x86_64-linux.tar.gz \
+            artifacts/lgpd-aarch64-linux.tar.gz \
+            artifacts/lgpd-aarch64-macos.tar.gz \
+            artifacts/SHA256SUMS
+          do
+            name="${asset##*/}"
+            encoded_name="$(jq -nr --arg value "$name" '$value | @uri')"
+            response="$(curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --request POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Content-Type: application/octet-stream" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --data-binary "@$asset" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$encoded_name")"
+            jq -e --arg name "$name" \
+              '.name == $name and .state == "uploaded"' \
+              <<<"$response" >/dev/null
+          done
+
+      - name: Verify exact draft, assets, and Linux runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.create_release.outputs.release_id }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          jq -e \
+            --argjson id "$RELEASE_ID" \
+            --arg tag "$TAG" \
+            --arg commit "$GITHUB_SHA" \
+            '.id == $id
+              and .tag_name == $tag
+              and .target_commitish == $commit
+              and .draft == true
+              and .prerelease == true' \
+            <<<"$release" >/dev/null
+
+          assets="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")"
+          test "$(jq 'length' <<<"$assets")" = 4
+          expected_names="$(printf '%s\n' \
+            lgpd-x86_64-linux.tar.gz \
+            lgpd-aarch64-linux.tar.gz \
+            lgpd-aarch64-macos.tar.gz \
+            SHA256SUMS | sort)"
+          actual_names="$(jq -r '.[].name' <<<"$assets" | sort)"
+          test "$actual_names" = "$expected_names"
 
           mkdir published-artifacts
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --dir published-artifacts
+          while IFS=$'\t' read -r asset_id asset_name; do
+            curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --location \
+              --header "Accept: application/octet-stream" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --output "published-artifacts/$asset_name" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done < <(jq -r '.[] | [.id, .name] | @tsv' <<<"$assets")
           (
             cd published-artifacts
             test "$(find . -maxdepth 1 -type f | wc -l)" = 4
@@ -295,20 +388,101 @@ jobs:
           grep -F "lgpd version $VERSION" <<<"$output"
           grep -F "commit: $GITHUB_SHA" <<<"$output"
 
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --draft=false --prerelease --latest=false
-
-      - name: Remove failed draft
-        if: failure()
+      - name: Publish exact verified release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.create_release.outputs.release_id }}
           TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_COMMIT: ${{ steps.claim_tag.outputs.expected_oid }}
         run: |
           set -euo pipefail
-          state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,targetCommitish \
-            --jq '[.isDraft, .targetCommitish] | @tsv' 2>/dev/null || true)"
-          if test "$state" = "$(printf 'true\t%s' "$GITHUB_SHA")"; then
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --yes --cleanup-tag
+          remote_oid="$(git ls-remote origin "refs/tags/$TAG" | cut -f1)"
+          test "$remote_oid" = "$EXPECTED_COMMIT"
+          response="$(jq -n \
+            '{draft: false, prerelease: true, make_latest: "false"}' |
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --input -)"
+          jq -e \
+            --argjson id "$RELEASE_ID" \
+            --arg tag "$TAG" \
+            '.id == $id
+              and .tag_name == $tag
+              and .draft == false
+              and .prerelease == true' \
+            <<<"$response" >/dev/null
+          remote_oid="$(git ls-remote origin "refs/tags/$TAG" | cut -f1)"
+          test "$remote_oid" = "$EXPECTED_COMMIT"
+
+      - name: Roll back only owned draft and exact tag
+        if: failure() && steps.claim_tag.outputs.owned == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.create_release.outputs.release_id }}
+          RELEASE_OWNED: ${{ steps.create_release.outputs.owned }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_COMMIT: ${{ steps.claim_tag.outputs.expected_oid }}
+        run: |
+          set -uo pipefail
+          cleanup_failed=0
+          can_delete_tag=false
+
+          if test "$RELEASE_OWNED" = true && test -n "$RELEASE_ID"; then
+            if release="$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" 2>/dev/null)"
+            then
+              if jq -e \
+                --argjson id "$RELEASE_ID" \
+                --arg tag "$TAG" \
+                --arg commit "$EXPECTED_COMMIT" \
+                '.id == $id
+                  and .tag_name == $tag
+                  and .target_commitish == $commit
+                  and .draft == true' \
+                <<<"$release" >/dev/null
+              then
+                if gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+                  >/dev/null
+                then
+                  can_delete_tag=true
+                else
+                  cleanup_failed=1
+                fi
+              else
+                cleanup_failed=1
+              fi
+            else
+              cleanup_failed=1
+            fi
+          elif test "$RELEASE_OWNED" != true && test -z "$RELEASE_ID"; then
+            can_delete_tag=true
+          else
+            cleanup_failed=1
           fi
+
+          tag_referenced=unknown
+          if release_tags="$(gh api --paginate \
+            --jq '.[].tag_name' \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          then
+            if grep -Fxq "$TAG" <<<"$release_tags"; then
+              tag_referenced=true
+            else
+              tag_referenced=false
+            fi
+          else
+            cleanup_failed=1
+          fi
+
+          remote_oid="$(git ls-remote origin "refs/tags/$TAG" | cut -f1)"
+          if test "$can_delete_tag" = true &&
+            test "$tag_referenced" = false &&
+            test "$remote_oid" = "$EXPECTED_COMMIT"
+          then
+            git push \
+              --force-with-lease="refs/tags/$TAG:$EXPECTED_COMMIT" \
+              origin ":refs/tags/$TAG" || cleanup_failed=1
+          fi
+
+          exit "$cleanup_failed"

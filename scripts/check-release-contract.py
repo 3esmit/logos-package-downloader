@@ -31,11 +31,14 @@ def main() -> None:
 
     version_path = args.root / "VERSION"
     changelog_path = args.root / "CHANGELOG.md"
+    workflow_path = args.root / ".github" / "workflows" / "release.yml"
 
     if not version_path.is_file():
         fail("VERSION is missing")
     if not changelog_path.is_file():
         fail("CHANGELOG.md is missing")
+    if not workflow_path.is_file():
+        fail("release workflow is missing")
 
     raw_version = version_path.read_text(encoding="utf-8")
     if not raw_version.endswith("\n") or raw_version.count("\n") != 1:
@@ -58,6 +61,11 @@ def main() -> None:
 
     if args.tag is not None and args.tag != version:
         fail(f"tag {args.tag} does not match VERSION {version}")
+
+    workflow = workflow_path.read_text(encoding="utf-8")
+    for unsafe_command in ("gh release delete", "--cleanup-tag"):
+        if unsafe_command in workflow:
+            fail(f"release workflow contains unsafe rollback command: {unsafe_command}")
 
     print(version)
 
