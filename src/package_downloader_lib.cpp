@@ -360,7 +360,14 @@ struct VersionPrecedenceDesc {
 struct RepositoryRegistry::Impl {
     std::string configPath;
     bool persistent = false;
+    // Two independent flags for the default repo:
+    //   defaultDisabled — soft state; row stays in list() with enabled=false
+    //                     so Settings can render a toggled-off entry.
+    //   defaultRemoved  — hard state; list() omits the default entirely.
+    //                     User must re-add by URL. Independent so a re-add
+    //                     restores the disabled state deterministically.
     bool defaultDisabled = false;
+    bool defaultRemoved  = false;
     std::vector<Repository> userRepos;        // persisted (url + enabled only)
     Repository defaultRepo;                   // always present
     std::shared_ptr<Fetcher> fetcher;
@@ -380,6 +387,7 @@ struct RepositoryRegistry::Impl {
         try {
             json j; f >> j;
             defaultDisabled = j.value("defaultDisabled", false);
+            defaultRemoved  = j.value("defaultRemoved",  false);
             userRepos.clear();
             if (j.contains("repositories") && j["repositories"].is_array()) {
                 for (const auto& r : j["repositories"]) {
@@ -400,6 +408,7 @@ struct RepositoryRegistry::Impl {
         json j;
         j["schemaVersion"] = 1;
         j["defaultDisabled"] = defaultDisabled;
+        j["defaultRemoved"]  = defaultRemoved;
         json arr = json::array();
         for (const auto& r : userRepos) {
             json e;
@@ -464,8 +473,10 @@ void RepositoryRegistry::setFetcher(std::shared_ptr<Fetcher> fetcher) {
 std::vector<Repository> RepositoryRegistry::list() const {
     std::lock_guard<std::mutex> lock(impl_->mu);
     std::vector<Repository> out;
-    if (!impl_->defaultDisabled) {
-        out.push_back(impl_->defaultRepo);
+    if (!impl_->defaultRemoved) {
+        Repository defCopy = impl_->defaultRepo;
+        defCopy.enabled = !impl_->defaultDisabled;
+        out.push_back(std::move(defCopy));
     }
     for (const auto& r : impl_->userRepos) out.push_back(r);
     return out;
@@ -476,8 +487,9 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
     if (!impl_->persistent) return "no config file (pass --config <path>)";
     if (url.empty()) return "url is empty";
     if (url == impl_->defaultRepo.url) {
-        // Re-adding the default URL restores it — clears the disabled flag.
-        if (!impl_->defaultDisabled) return "already registered: " + url;
+        if (!impl_->defaultRemoved && !impl_->defaultDisabled)
+            return "already registered: " + url;
+        impl_->defaultRemoved  = false;
         impl_->defaultDisabled = false;
         impl_->refreshOne(impl_->defaultRepo);
         return impl_->save();
@@ -501,9 +513,8 @@ std::string RepositoryRegistry::removeRepository(const std::string& url) {
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (!impl_->persistent) return "no config file (pass --config <path>)";
     if (url == impl_->defaultRepo.url) {
-        // Set the persisted flag; list() will omit the default repo entirely
-        // until the config is reset or the flag is cleared.
-        impl_->defaultDisabled = true;
+        if (impl_->defaultRemoved) return "not registered: " + url;
+        impl_->defaultRemoved = true;
         return impl_->save();
     }
     auto it = std::find_if(impl_->userRepos.begin(), impl_->userRepos.end(),
@@ -517,6 +528,7 @@ std::string RepositoryRegistry::setEnabled(const std::string& url, bool enabled)
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (url == impl_->defaultRepo.url) {
         if (!impl_->persistent) return "no config file (pass --config <path>)";
+        if (impl_->defaultRemoved) return "not registered: " + url;
         impl_->defaultDisabled = !enabled;
         return impl_->save();
     }
@@ -533,7 +545,7 @@ std::string RepositoryRegistry::setEnabled(const std::string& url, bool enabled)
 std::string RepositoryRegistry::refresh() {
     std::lock_guard<std::mutex> lock(impl_->mu);
     std::vector<std::string> errs;
-    if (!impl_->defaultDisabled) {
+    if (!impl_->defaultRemoved && !impl_->defaultDisabled) {
         impl_->refreshOne(impl_->defaultRepo);
         if (!impl_->defaultRepo.resolveError.empty()) {
             errs.push_back("default: " + impl_->defaultRepo.resolveError);
@@ -555,6 +567,7 @@ std::optional<Repository> RepositoryRegistry::findByUrlOrName(const std::string&
         return r.url == s || (!r.name.empty() && r.name == s);
     };
     if (match(impl_->defaultRepo)) {
+        if (impl_->defaultRemoved) return std::nullopt;
         Repository copy = impl_->defaultRepo;
         copy.enabled = !impl_->defaultDisabled;
         return copy;

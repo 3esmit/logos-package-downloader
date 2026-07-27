@@ -78,9 +78,10 @@ logos-co modules release — even with no configuration at all. This is what
 makes `lgpd list` work out of the box. The default repository has special
 rules:
 
-- It is **always present** in the merged view.
-- It can be **disabled** (a `defaultDisabled` flag) but **never removed**, and
-  it can never be re-added as a user repository.
+- It is present in the merged view by default.
+- It can be **disabled** (`defaultDisabled` — row stays with `enabled=false`)
+  or **removed** (`defaultRemoved` — row omitted). Re-adding
+  `kDefaultRepositoryUrl` restores it. It is never stored as a user repo.
 - It is **never written** into the user config's repository list; only user
   repositories are persisted. Its identity is compiled in.
 
@@ -91,6 +92,7 @@ User repositories are persisted to a JSON config file with a stable schema:
 ```
 { "schemaVersion": 1,
   "defaultDisabled": false,
+  "defaultRemoved":  false,
   "repositories": [ { "url": "...", "enabled": true }, ... ] }
 ```
 
@@ -416,8 +418,8 @@ machine-readable data source for scripts and agents.
 - **Repository mutations need a config file.** `add` / `remove` / `enable` /
   `disable` and `config show` require a config path; an in-memory client
   refuses them.
-- **The default repository is immutable as an entry.** It can be disabled but
-  never removed, and cannot be re-added.
+- **The default repository URL is compiled in.** It can be disabled or
+  removed by the user; re-adding the same URL restores it.
 - **The range matcher is a semver subset.** Build metadata is ignored; only
   basic pre-release ordering is honoured.
 - **Trust is not evaluated here.** Verification binds index → file (same DID,
