@@ -489,9 +489,13 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
     if (url == impl_->defaultRepo.url) {
         if (!impl_->defaultRemoved && !impl_->defaultDisabled)
             return "already registered: " + url;
+        Repository probe = impl_->defaultRepo;
+        probe.enabled = true;
+        impl_->refreshOne(probe);
+        if (!probe.resolveError.empty()) return probe.resolveError;
+        impl_->defaultRepo     = std::move(probe);
         impl_->defaultRemoved  = false;
         impl_->defaultDisabled = false;
-        impl_->refreshOne(impl_->defaultRepo);
         return impl_->save();
     }
     if (!isHttpsUrl(url)) return "unsupported URL scheme (https required in v1)";
@@ -526,13 +530,12 @@ std::string RepositoryRegistry::removeRepository(const std::string& url) {
 
 std::string RepositoryRegistry::setEnabled(const std::string& url, bool enabled) {
     std::lock_guard<std::mutex> lock(impl_->mu);
+    if (!impl_->persistent) return "no config file (pass --config <path>)";
     if (url == impl_->defaultRepo.url) {
-        if (!impl_->persistent) return "no config file (pass --config <path>)";
         if (impl_->defaultRemoved) return "not registered: " + url;
         impl_->defaultDisabled = !enabled;
         return impl_->save();
     }
-    if (!impl_->persistent) return "no config file (pass --config <path>)";
     for (auto& r : impl_->userRepos) {
         if (r.url == url) {
             r.enabled = enabled;
@@ -545,7 +548,7 @@ std::string RepositoryRegistry::setEnabled(const std::string& url, bool enabled)
 std::string RepositoryRegistry::refresh() {
     std::lock_guard<std::mutex> lock(impl_->mu);
     std::vector<std::string> errs;
-    if (!impl_->defaultRemoved && !impl_->defaultDisabled) {
+    if (!impl_->defaultRemoved) {
         impl_->refreshOne(impl_->defaultRepo);
         if (!impl_->defaultRepo.resolveError.empty()) {
             errs.push_back("default: " + impl_->defaultRepo.resolveError);
