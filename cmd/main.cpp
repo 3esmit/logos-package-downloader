@@ -274,7 +274,7 @@ int cmdConfigInit(const std::string& path) {
         std::cerr << "Error: cannot write " << path << "\n";
         return 1;
     }
-    f << "{\n  \"schemaVersion\": 1,\n  \"repositories\": [],\n  \"defaultDisabled\": false\n}\n";
+    f << "{\n  \"schemaVersion\": 1,\n  \"repositories\": [],\n  \"defaultDisabled\": false,\n  \"defaultRemoved\": false\n}\n";
     if (!f.good()) { std::cerr << "Error: write failed: " << path << "\n"; return 1; }
     std::cout << "Created " << path << "\n";
     return 0;
