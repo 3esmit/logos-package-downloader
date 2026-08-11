@@ -665,6 +665,7 @@ struct PackageDownloaderLib::Impl {
                     entry["category"]    = firstManifest.value("category", "");
                     entry["author"]      = firstManifest.value("author", "");
                     entry["icon"]        = firstManifest.value("icon", "");
+    		        entry["manifestVersion"] = firstManifest.value("manifestVersion", "");
                 }
                 auto versions = pkg.value("versions", json::array());
                 std::stable_sort(versions.begin(), versions.end(), VersionPrecedenceDesc{});
