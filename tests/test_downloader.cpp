@@ -660,3 +660,51 @@ TEST(Catalog, ReturnsJsonArrayWhenNoNetwork) {
     ASSERT_NO_THROW(catalog = json::parse(lib.getCatalogJson()));
     EXPECT_TRUE(catalog.is_array());
 }
+
+TEST(Catalog, IconUrlIsConstructedFromTopLevelIconAndIndexUrl) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json v = makeVersion("0.1.0", "h_010", json::array());
+    v["manifest"]["name"] = "widget";
+    v["manifest"]["icon"] = "assets/icon.png";  // legacy relative path
+    v["icon"] = {                                // schema-v2 top-level object
+        {"path", "26fa06d3.png"},
+        {"sha256", "26fa06d3"},
+        {"size", 7375},
+    };
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({v})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto catalog = json::parse(lib.getCatalogJson());
+    ASSERT_EQ(catalog.size(), 1u);
+    // dirname("https://test.local/index.json") + "/26fa06d3.png"
+    EXPECT_EQ(catalog[0].value("icon", ""),
+              "https://test.local/26fa06d3.png");
+}
+
+TEST(Catalog, IconAbsentWhenNoTopLevelIcon) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json v = makeVersion("0.1.0", "h_010", json::array());
+    v["manifest"]["name"] = "widget";
+    v["manifest"]["icon"] = "assets/icon.png";
+    // deliberately NO top-level v["icon"]
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({v})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto catalog = json::parse(lib.getCatalogJson());
+    ASSERT_EQ(catalog.size(), 1u);
+    EXPECT_FALSE(catalog[0].contains("icon"));
+}

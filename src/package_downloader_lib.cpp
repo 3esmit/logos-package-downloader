@@ -673,14 +673,20 @@ struct PackageDownloaderLib::Impl {
                 // embedded manifest (constant across a package's versions).
                 if (pkg.contains("versions") && pkg["versions"].is_array()
                     && !pkg["versions"].empty()) {
-                    const json& firstManifest = objOrEmpty(pkg["versions"][0], "manifest");
+                    const json& firstVersion = pkg["versions"][0];
+                    const json& firstManifest = objOrEmpty(firstVersion, "manifest");
                     entry["displayName"] = firstManifest.value("display_name", "");
                     entry["description"] = firstManifest.value("description", "");
                     entry["type"]        = firstManifest.value("type", "");
                     entry["category"]    = firstManifest.value("category", "");
                     entry["author"]      = firstManifest.value("author", "");
-                    entry["icon"]        = firstManifest.value("icon", "");
-    		        entry["manifestVersion"] = firstManifest.value("manifestVersion", "");
+                    entry["manifestVersion"] = firstManifest.value("manifestVersion", "");
+                    const std::string iconPath =
+                        objOrEmpty(firstVersion, "icon").value("path", "");
+                    const auto slash = r.indexUrl.find_last_of('/');
+                    if (!iconPath.empty() && slash != std::string::npos) {
+                        entry["icon"] = r.indexUrl.substr(0, slash) + "/" + iconPath;
+                    }
                 }
                 auto versions = pkg.value("versions", json::array());
                 std::stable_sort(versions.begin(), versions.end(), VersionPrecedenceDesc{});
