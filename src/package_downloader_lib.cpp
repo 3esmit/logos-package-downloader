@@ -153,6 +153,20 @@ std::string cacheBustedUrl(const std::string& url) {
 // Resolved once and shared by every transfer (the lgpd CLI and the
 // in-process package_downloader module both reach here).
 void applyCaBundle(CURL* c) {
+#ifdef _WIN32
+    // Windows has no filesystem CA bundle to probe for: trust anchors live in
+    // the system certificate store, reachable only through the Win32 crypto
+    // API. Every path below would miss, leaving curl on its compiled-in
+    // default -- which for a Nix-cross-built libcurl is a /nix/store path that
+    // does not exist on the target machine, so every HTTPS fetch fails with an
+    // opaque "fetch failed".
+    //
+    // CURLSSLOPT_NATIVE_CA (curl >= 7.71) makes the OpenSSL backend import the
+    // Windows store instead. Set rather than probed, so it is also correct on
+    // a machine whose certificates were updated after this binary was built.
+    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+    return;
+#else
     // { CAINFO file, CAPATH dir }. Both empty ⇒ nothing usable found, so
     // leave curl on its compiled-in default rather than break a working host.
     static const std::pair<std::string, std::string> ca = [] {
@@ -192,6 +206,7 @@ void applyCaBundle(CURL* c) {
 
     if (!ca.first.empty())  curl_easy_setopt(c, CURLOPT_CAINFO, ca.first.c_str());
     if (!ca.second.empty()) curl_easy_setopt(c, CURLOPT_CAPATH, ca.second.c_str());
+#endif  // _WIN32
 }
 
 // Compact reason a libcurl transfer failed: the libcurl error string (with
@@ -658,13 +673,20 @@ struct PackageDownloaderLib::Impl {
                 // embedded manifest (constant across a package's versions).
                 if (pkg.contains("versions") && pkg["versions"].is_array()
                     && !pkg["versions"].empty()) {
-                    const json& firstManifest = objOrEmpty(pkg["versions"][0], "manifest");
+                    const json& firstVersion = pkg["versions"][0];
+                    const json& firstManifest = objOrEmpty(firstVersion, "manifest");
                     entry["displayName"] = firstManifest.value("display_name", "");
                     entry["description"] = firstManifest.value("description", "");
                     entry["type"]        = firstManifest.value("type", "");
                     entry["category"]    = firstManifest.value("category", "");
                     entry["author"]      = firstManifest.value("author", "");
-                    entry["icon"]        = firstManifest.value("icon", "");
+                    entry["manifestVersion"] = firstManifest.value("manifestVersion", "");
+                    const std::string iconPath =
+                        objOrEmpty(firstVersion, "icon").value("path", "");
+                    const auto slash = r.indexUrl.find_last_of('/');
+                    if (!iconPath.empty() && slash != std::string::npos) {
+                        entry["icon"] = r.indexUrl.substr(0, slash) + "/" + iconPath;
+                    }
                 }
                 auto versions = pkg.value("versions", json::array());
                 std::stable_sort(versions.begin(), versions.end(), VersionPrecedenceDesc{});
@@ -974,9 +996,18 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // Derive destination path.
             std::string destDir = outputDir;
             if (destDir.empty()) {
-                const char* tmp = std::getenv("TMPDIR");
-                if (!tmp) tmp = "/tmp";
-                destDir = tmp;
+                // temp_directory_path() is the portable form of what this used
+                // to hand-roll. The old code read TMPDIR and fell back to
+                // "/tmp", neither of which exists on Windows -- downloads would
+                // have gone to a non-existent directory. The standard function
+                // consults TMPDIR/TMP/TEMP/TEMPDIR then /tmp on POSIX, and
+                // TMP/TEMP/USERPROFILE then the Windows directory on Windows.
+                // Uses the error_code overload so a missing temp dir surfaces
+                // as a failed download rather than an exception escaping here.
+                std::error_code ec;
+                const fs::path tmp = fs::temp_directory_path(ec);
+                if (ec || tmp.empty()) return {};   // caller reports the failure
+                destDir = tmp.string();
             }
             std::string filename = fs::path(url).filename().string();
             if (filename.empty()) filename = packageName + ".lgx";
