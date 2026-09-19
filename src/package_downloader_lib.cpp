@@ -934,10 +934,26 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
 
     // ── 2c. Signer binding ───────────────────────────────────────────
     // When the index advertised a signer DID, the file must be signed
-    // by the SAME DID. We don't re-verify the Ed25519 here
-    // (package_manager does, against the trust keyring) — we only bind
-    // index→file so a swap to a differently-signed (or unsigned)
-    // package is caught even under the WARN signature policy.
+    // by the SAME DID — and the signature must actually VERIFY.
+    //
+    // `signature_valid`, not `is_signed`, and never `signer_did` on its
+    // own. logos-package populates signer_did straight out of
+    // manifest.sig BEFORE it runs the Ed25519 check
+    // (Package::verifySignature sets info.signer_did, then may return
+    // early on a bad DID, a malformed signature, or a failed verify),
+    // so signer_did is a CLAIM the package makes about itself until
+    // that check passes. This block used to read only is_signed and
+    // signer_did, so a substituted package carrying a hand-written
+    // manifest.sig that merely NAMED the advertised DID satisfied the
+    // binding: an attacker did not need the key, only the DID string,
+    // which the catalog publishes.
+    //
+    // Verifying here does NOT make this an authorization check — no
+    // keyring is consulted and none should be; the trust-anchor gate in
+    // logos-package-manager owns that. All this asks is whether the
+    // bytes we downloaded really are the ones the advertised publisher
+    // signed, which is the only reading under which "binds index→file"
+    // is true at all.
     const json& advSig = objOrEmpty(indexEntry, "signature");
     if (!advSig.empty()) {
         const std::string advDid = advSig.value("did", "");
@@ -945,12 +961,24 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
             lgx_signature_info_t info =
                 lgx_verify_signature(lgxPath.c_str(), nullptr);
             const bool fileSigned = info.is_signed;
+            const bool fileSigValid = info.signature_valid;
             const std::string fileDid =
                 info.signer_did ? info.signer_did : "";
             lgx_free_signature_info(info);
-            if (!fileSigned || fileDid != advDid) {
+            if (!PackageDownloaderLib::downloadedSignerBinds(
+                    fileSigned, fileSigValid, fileDid, advDid)) {
                 errMsg = "downloaded package signer does not match the "
-                         "catalog (expected " + advDid + ")";
+                         "catalog (expected " + advDid;
+                // Name WHICH of the three it was: "expected X" alone
+                // reads as a DID mismatch, and sends whoever hits the
+                // forged case looking for the wrong problem entirely.
+                if (!fileSigned)
+                    errMsg += ", file is unsigned)";
+                else if (!fileSigValid)
+                    errMsg += ", file claims " + (fileDid.empty() ? std::string("no DID") : fileDid)
+                            + " but its signature does not verify)";
+                else
+                    errMsg += ", got " + fileDid + ")";
                 return false;
             }
         }
@@ -1053,6 +1081,26 @@ struct ParsedDep {
     std::optional<std::string> repositoryUrl;
 };
 
+// A dependency's `signer` field DISAMBIGUATES among same-named candidates: "of
+// the several packages called `bm` in the merged catalog, I mean the one this
+// identity published". IT IS NOT AN AUTHORIZATION. Matching a pin does not make
+// a package installable; that is the install-time TRUST-ANCHOR POLICY in
+// logos-package-manager, which refuses a package no ACTIVE anchor validates.
+// Both checks are needed and they are not the same check — a bare identifier in
+// a manifest or a catalog entry establishes no trust anchor, so nothing this
+// function accepts may ever be read as permission to install.
+//
+// A did:jwk that is syntactically well-formed, matched against a catalog row,
+// and freely chosen by whoever wrote the manifest. That is all it is.
+bool isValidDidJwk(const std::string& s) {
+    // Same predicate as logos-package's Manifest::validate (src/core/manifest.cpp:29),
+    // which is what `lgx verify` enforces on a package's own manifest. It is
+    // duplicated rather than shared because logos-package does not export it —
+    // one spec, two implementations; keep them in step.
+    static const std::regex re("^did:jwk:[A-Za-z0-9_-]+$");
+    return std::regex_match(s, re);
+}
+
 bool parseDep(const json& j, ParsedDep& out, std::string& err) {
     if (j.is_string()) { out.name = j.get<std::string>(); return true; }
     if (!j.is_object()) { err = "dependency entry must be string or object"; return false; }
@@ -1062,8 +1110,54 @@ bool parseDep(const json& j, ParsedDep& out, std::string& err) {
     out.name = j["name"].get<std::string>();
     if (j.contains("version") && j["version"].is_string())
         out.versionRange = j["version"].get<std::string>();
-    if (j.contains("signer") && j["signer"].is_string())
-        out.signer = j["signer"].get<std::string>();
+
+    // `signer` — REGRESSION (B1). This used to read
+    //
+    //     if (j.contains("signer") && j["signer"].is_string())
+    //         out.signer = j["signer"].get<std::string>();
+    //
+    // so `"signer": ""` parsed clean with the option ENGAGED holding "".
+    // findBest then compared that against each candidate's `signature.did`,
+    // and an UNSIGNED row yields "" — so the pin matched exactly the rows with
+    // NO signature and skipped every signed one. Against a catalog holding
+    // bm 2.0.0 (signed) and bm 1.0.0 (unsigned), `{"name":"bm","signer":""}`
+    // resolved to the unsigned, OLDER 1.0.0, with no error. A signer pin must
+    // select AMONG candidates; it must never be a route TO the unsigned ones.
+    //
+    // And a non-string or null `signer` fell through the `is_string()` guard
+    // and left the dep UNPINNED — a declared constraint silently widened to
+    // "anything", which is the one outcome a pin exists to prevent.
+    //
+    // THE RULE, for this field: absent means unpinned; PRESENT means it must be
+    // a syntactically valid did:jwk. Null, "", a non-string and a malformed DID
+    // are all hard errors. There is no shape of this key that quietly widens
+    // the candidate set, and none that narrows it onto the unsigned rows.
+    //
+    // Nothing upstream would catch it either: `lgx verify` runs
+    // Manifest::validate on a package's own manifest, but this resolver reads
+    // catalog-EMBEDDED manifests and a caller-supplied top-level array, and
+    // validates neither. This is the only gate on both paths.
+    if (j.contains("signer")) {
+        if (!j["signer"].is_string()) {
+            err = "dependency '" + out.name + "' has a non-string 'signer' — omit the "
+                  "field to leave the signer unpinned";
+            return false;
+        }
+        const std::string signer = j["signer"].get<std::string>();
+        if (signer.empty()) {
+            err = "dependency '" + out.name + "' declares an empty 'signer' — omit the "
+                  "field to leave the signer unpinned; an empty pin is not 'no pin', "
+                  "it selects the releases that carry no signature";
+            return false;
+        }
+        if (!isValidDidJwk(signer)) {
+            err = "dependency '" + out.name + "' declares a malformed 'signer' DID '"
+                + signer + "' — expected did:jwk:<base64url>";
+            return false;
+        }
+        out.signer = signer;
+    }
+
     if (j.contains("repositoryUrl") && j["repositoryUrl"].is_string())
         out.repositoryUrl = j["repositoryUrl"].get<std::string>();
     return true;
@@ -1158,11 +1252,20 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                 if (!v.is_object()) continue;
                 std::string ver = objOrEmpty(v, "manifest").value("version", "");
                 if (dep.versionRange && !semverRangeMatches(*dep.versionRange, ver)) continue;
+                // Signer pin — SELECTION ONLY. This narrows the candidate set
+                // and does nothing else: no keyring is consulted here, no
+                // anchor set exists in this process, and a satisfied pin
+                // produces an ordinary resolved entry that the installer will
+                // still judge on its own terms.
+                //
+                // parseDep already refuses an empty pin, but that is input
+                // validation on one call path. signerPinMatches is the
+                // invariant itself, sitting next to the comparison it
+                // constrains, so a ParsedDep constructed some other way cannot
+                // reopen B1.
                 if (dep.signer) {
-                    std::string sigDid;
-                    if (v.contains("signature") && v["signature"].is_object())
-                        sigDid = v["signature"].value("did", "");
-                    if (sigDid != *dep.signer) continue;
+                    const std::string sigDid = objOrEmpty(v, "signature").value("did", "");
+                    if (!PackageDownloaderLib::signerPinMatches(*dep.signer, sigDid)) continue;
                 }
                 // Rank by SemVer precedence, NOT by release date — see
                 // PackageDownloaderLib::outranks.
@@ -1270,11 +1373,36 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         // later transitive encounter of the same name defers to it (above).
         if (qe.isTopLevel) topLevelChosen[dep.name] = ver;
         // Enqueue transitive deps from the chosen version's manifest.
+        //
+        // A dependency entry that cannot be parsed is REPORTED and resolution
+        // STOPS. The old `if (parseDep(...)) push` swallowed the failure, so a
+        // manifest whose dependency entry had an unusable shape lost the EDGE
+        // ITSELF — the dep never entered the queue, never appeared in the plan,
+        // and the install proceeded looking complete with a required package
+        // missing. (Same defect class as lgpm's manifest scan dropping
+        // object-form dependency entries, fixed in logos-package-manager #34.)
+        //
+        // This matters directly for the signer pin: rejecting `"signer": ""`
+        // at parse only helps if the rejection is visible. Dropped, an empty
+        // pin in a transitive manifest would go from "silently selects the
+        // unsigned release" to "silently drops the dependency" — a different
+        // wrong answer, equally quiet.
+        //
+        // Stopping rather than collecting is deliberate: the return value is
+        // an INSTALL PLAN, and a plan with a hole in it must not be executed
+        // partially. The top-level loop below already stops on the same
+        // condition; matching it keeps one rule for both entry paths.
         if (chosenManifest.contains("dependencies") && chosenManifest["dependencies"].is_array()) {
             for (const auto& sub : chosenManifest["dependencies"]) {
                 ParsedDep d; std::string serr;
-                if (parseDep(sub, d, serr))
-                    queue.push_back({std::move(d), /*isTopLevel=*/false});
+                if (!parseDep(sub, d, serr)) {
+                    json e;
+                    e["error"] = "in dependencies of '" + dep.name + "' @ " + ver + ": " + serr;
+                    e["name"]  = dep.name;
+                    out.push_back(std::move(e));
+                    return out.dump();
+                }
+                queue.push_back({std::move(d), /*isTopLevel=*/false});
             }
         }
     }
@@ -1285,6 +1413,39 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
 
 bool PackageDownloaderLib::semverMatches(const std::string& range, const std::string& version) {
     return semverRangeMatches(range, version);
+}
+
+bool PackageDownloaderLib::signerPinMatches(const std::string& pin,
+                                            const std::string& candidateSignerDid) {
+    // Stated positively on purpose. The predicate this replaced was
+    // `candidateSignerDid != pin`, which is true-by-accident for the pair
+    // ("", "") — an empty pin against a candidate with no signature — and so
+    // made an empty pin SELECT exactly the unsigned releases (B1). Written as
+    // "both sides must be a real identity, and they must be the same one",
+    // that pair cannot arise: neither an empty pin nor an unsigned candidate
+    // can satisfy anything.
+    if (pin.empty() || candidateSignerDid.empty()) return false;
+    return pin == candidateSignerDid;
+}
+
+bool PackageDownloaderLib::downloadedSignerBinds(bool fileSigned,
+                                                 bool fileSignatureValid,
+                                                 const std::string& fileSignerDid,
+                                                 const std::string& advertisedDid) {
+    // Stated as a conjunction of everything that must hold, for the same
+    // reason signerPinMatches is stated positively: the predicate this
+    // replaced was `fileSigned && fileDid == advDid`, and the missing term was
+    // invisible precisely because the two present ones read as sufficient.
+    //
+    // An empty advertised DID never binds anything — callers only reach here
+    // with a non-empty one, but the invariant belongs next to the comparison
+    // so a caller constructed some other way cannot reopen it.
+    if (advertisedDid.empty()) return false;
+    if (!fileSigned) return false;
+    // THE TERM THAT WAS MISSING. Without it, `fileSignerDid` is only what the
+    // package says about itself.
+    if (!fileSignatureValid) return false;
+    return fileSignerDid == advertisedDid;
 }
 
 bool PackageDownloaderLib::outranks(const std::string& candidateVersion, const std::string& candidateDate,
